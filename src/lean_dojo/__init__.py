@@ -22,6 +22,7 @@ from .interaction.dojo import (
     DojoHardTimeoutError,
     DojoInitError,
     Dojo,
+    InitOptimizedDojo,
     ProofFinished,
     ProofGivenUp,
 )

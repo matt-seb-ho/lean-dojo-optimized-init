@@ -165,20 +165,11 @@ class Dojo:
 
         # Work in a temporary directory.
         self.origin_dir = Path.cwd()
-        self.tmp_dir = Path(mkdtemp(dir=TMP_DIR))
 
         try:
             self._install_handlers()
-            os.chdir(self.tmp_dir)
-
-            # Copy and `cd` into the repo.
             traced_repo_path = get_traced_repo_path(self.repo)
-            shutil.copytree(
-                traced_repo_path,
-                self.repo.name,
-                ignore=ignore_patterns("*.dep_paths", "*.ast.json", "*.trace.xml"),
-            )
-            os.chdir(self.repo.name)
+            self._setup_repo(traced_repo_path)
 
             # Replace the human-written proof with a `repl` tactic.
             try:
@@ -193,13 +184,14 @@ class Dojo:
             # Run the modified file in a container.
             self.container = get_container()
             logger.debug(f"Launching the proof using {type(self.container)}")
-            mts = [Mount(Path.cwd(), Path(f"/workspace/{self.repo.name}"))]
+            mts = self._get_mts()
+            work_dir = self._get_work_dir()
             self.container.run(
                 "lake build Lean4Repl",
                 mts,
                 as_current_user=True,
                 capture_output=True,
-                work_dir=f"/workspace/{self.repo.name}",
+                work_dir=work_dir,
                 cpu_limit=None,
                 memory_limit=None,
                 envs={},
@@ -213,7 +205,7 @@ class Dojo:
                 mts,
                 cpu_limit=None,
                 memory_limit=None,
-                work_dir=f"/workspace/{self.repo.name}",
+                work_dir=work_dir,
                 as_current_user=True,
                 envs={},
             )
@@ -250,8 +242,7 @@ class Dojo:
             return self, init_state
 
         except Exception as ex:
-            os.chdir(self.origin_dir)
-            shutil.rmtree(self.tmp_dir)
+            self._cleanup_tmp_dir()
             raise ex
 
     def _locate_traced_file(self, traced_repo_path: Path) -> TracedFile:
@@ -372,29 +363,7 @@ class Dojo:
                 + lean_file[pos:]
             )
 
-        repl_file = "Lean4Repl.lean"
-        repl_dst = Path(repl_file)
-
-        if os.path.exists("lakefile.lean"):
-            with open("lakefile.lean", "a") as oup:
-                oup.write("\nlean_lib Lean4Repl {\n\n}\n")
-        else:
-            assert os.path.exists("lakefile.toml")
-            with open("lakefile.toml", "a") as oup:
-                oup.write('\n[[lean_lib]]\nname = "Lean4Repl"\n')
-
-        if os.path.exists("lakefile.olean"):
-            os.remove("lakefile.olean")
-        if os.path.exists(".lake/lakefile.olean"):
-            os.remove(".lake/lakefile.olean")
-
-        # Copy the REPL code to the right directory.
-        repl_src = Path(__file__).with_name(repl_file)
-        repl_code = repl_src.open().read()
-        if repl_dst.exists():
-            raise DojoInitError(f"{repl_dst} exists")
-        with repl_dst.open("wt") as oup:
-            oup.write(repl_code)
+        self._prepare_auxiliary_files()
 
         # Write the modified code to the file.
         with self.file_path.open("wt") as oup:
@@ -547,3 +516,197 @@ class Dojo:
                     pass
             else:
                 msg.append(line)
+
+    def _setup_repo(self, traced_repo_path) -> None:
+        """Copy and `cd` into the repo."""
+        if not hasattr(self, "tmp_dir"):
+            self.tmp_dir = Path(mkdtemp(dir=TMP_DIR))
+
+        os.chdir(self.tmp_dir)
+        # Copy and `cd` into the repo.
+        shutil.copytree(
+            traced_repo_path,
+            self.repo.name,
+            ignore=ignore_patterns("*.dep_paths", "*.ast.json", "*.trace.xml"),
+        )
+        os.chdir(self.repo.name)
+    
+    def _get_mts(self):
+        return [Mount(Path.cwd(), Path(f"/workspace/{self.repo.name}"))]
+    
+    def _get_work_dir(self):
+        return f"/workspace/{self.repo.name}"
+
+    def _prepare_auxiliary_files(self) -> None:
+        """Copy Lean4Repl.lean to the copied repo and modify the lakefile."""
+        repl_file = "Lean4Repl.lean"
+        repl_dst = Path(repl_file)
+
+        if os.path.exists("lakefile.lean"):
+            with open("lakefile.lean", "a") as oup:
+                oup.write("\nlean_lib Lean4Repl {\n\n}\n")
+        else:
+            assert os.path.exists("lakefile.toml")
+            with open("lakefile.toml", "a") as oup:
+                oup.write('\n[[lean_lib]]\nname = "Lean4Repl"\n')
+
+        if os.path.exists("lakefile.olean"):
+            os.remove("lakefile.olean")
+        if os.path.exists(".lake/lakefile.olean"):
+            os.remove(".lake/lakefile.olean")
+
+        # Copy the REPL code to the right directory.
+        repl_src = Path(__file__).with_name(repl_file)
+        repl_code = repl_src.open().read()
+        if repl_dst.exists():
+            raise DojoInitError(f"{repl_dst} exists")
+        with repl_dst.open("wt") as oup:
+            oup.write(repl_code)
+
+
+class InitOptimizedDojo(Dojo):
+    """
+    Slightly modified version of the Dojo class that is optimized for initialization.
+    Adapting changes from https://github.com/doragera/LeanDojo/pull/3
+
+    - In the original Dojo class, the repo is copied each time Dojo.__enter__ is called.
+      - The only modifications made to the working repo copy are 
+          - adding Lean4Repl.lean (including to the lakefile)
+          - modifying the target theorem's proof to include the Lean4Repl tactic
+    - This version refactors this initialization process to be a class-level operation
+      - Only one copy of the repo is made
+      - Initialization the Dojo for a theorem only makes a backup of the target file
+      - Further initialization of the same repo is skipped
+
+    """
+    initialized_repos = set()
+    
+    @classmethod
+    def check_repo_init(cls, repo: LeanGitRepo, tmp_dir: Path):
+        # check that the repo has been copied to the temporary directory
+        if not (tmp_dir / repo.name).exists():
+            return False
+        # check that Lean4Repl.lean has been added to the repo
+        if not (tmp_dir / repo.name / "Lean4Repl.lean").exists():
+            return False
+        # check that Lean4Repl has been added to the lakefile
+        # - check that a lakefile exists
+        lean_lakefile = tmp_dir / repo.name / "lakefile.lean"
+        toml_lakefile = tmp_dir / repo.name / "lakefile.toml"
+        if lean_lakefile.exists():
+            lakefile_path = lean_lakefile
+        elif toml_lakefile.exists():
+            lakefile_path = toml_lakefile
+        else:
+            return False
+        # - check that Lean4Repl is in the lakefile
+        with open(lakefile_path, "r") as inp:
+            lakefile_content = inp.read()
+            if "Lean4Repl" not in lakefile_content:
+                return False
+            
+        # all checks passsed
+        cls.initialized_repos.add(repo.name)
+        return True
+
+    @classmethod
+    def init_repo(cls, repo: LeanGitRepo, tmp_dir: Path):
+        # avoid duplicate work
+        if (
+            repo.name in cls.initialized_repos
+            or InitOptimizedDojo.check_repo_init(repo, tmp_dir)
+        ):
+            logger.debug("Repo already initialized. Skipping.")
+            return
+
+        logger.debug(f"Initializing repo {repo.name} in {tmp_dir}")
+        # copy the repo to the temporary directory.
+        copy_path = tmp_dir / repo.name
+        shutil.copytree(
+            get_traced_repo_path(repo),
+            copy_path,
+            ignore=ignore_patterns("*.dep_paths", "*.ast.json", "*.trace.xml"),
+        )
+
+        # copy Lean4Repl.lean to the repo
+        repl_file = "Lean4Repl.lean"
+        repl_dst = copy_path / repl_file
+        repl_src = Path(__file__).with_name(repl_file)
+        # repl_code = repl_src.open().read()
+        with open(repl_src, "r") as inp:
+            repl_code = inp.read()
+        with repl_dst.open("wt") as oup:
+            oup.write(repl_code)
+
+        # add Lean4Repl to the lakefile (.lean or .toml)
+        if (copy_path / "lakefile.lean").exists():
+            lakefile_path = copy_path / "lakefile.lean"
+            repl_lakefile_addition = "\nlean_lib Lean4Repl {\n\n}\n"
+        else:
+            lakefile_path = copy_path / "lakefile.toml"
+            assert lakefile_path.exists()
+            repl_lakefile_addition = '\n[[lean_lib]]\nname = "Lean4Repl"\n'
+
+        with open(lakefile_path, "r") as inp:
+            lakefile_content = inp.read()
+        if "Lean4Repl" not in lakefile_content:
+            with open(lakefile_path, "a") as oup:
+                oup.write(repl_lakefile_addition)
+        
+        # mark the repo as initialized
+        cls.initialized_repos.add(repo.name)
+
+    def __init__(
+        self,
+        entry: Union[Theorem, Tuple[LeanGitRepo, Path, int]],
+        tmp_dir: Path,
+        hard_timeout: Optional[float] = None,
+        additional_imports: List[str] = [],
+    ):
+        super().__init__(entry, hard_timeout, additional_imports)
+        self.tmp_dir = tmp_dir
+        self.init_repo(self.repo, self.tmp_dir)
+    
+    def _setup_repo(self, traced_repo_path) -> None:
+        # switch to the traced repo inside the temporary directory
+        # - patches the original Dojo's copying the repo and cd-ing in
+        os.chdir(self.tmp_dir / self.repo.name)
+    
+    def _get_mts(self):
+        return []
+    
+    def _get_work_dir(self):
+        return None
+
+    def _cleanup_tmp_dir(self) -> None:
+        # restores modified file instead of deleting the temporary directory
+        # - patches the original Dojo's __enter__ exception handling & __exit__ cleanup
+        logger.debug(f"Restoring modified file.")
+        os.rename(self.file_path.with_suffix(".bak"), self.file_path)
+        os.chdir(self.origin_dir)
+
+    def _modify_file(self, traced_file: TracedFile) -> None:
+        # modifies the target file only 
+        # (copying Repl code and editing the lakefile has been relegated to the preflight checks)
+        logger.debug(f"Modifying {traced_file.lean_file.path}")
+
+        assert self.uses_tactics
+        self._prepare_auxiliary_files() # make a backup of the file
+        modified_code = self._modify_proof(traced_file)
+
+        # Write the modified code to the file.
+        with self.file_path.open("wt") as oup:
+            oup.write(modified_code)
+    
+    def _prepare_auxiliary_files(self) -> None:
+        # instead of preparing Lean4Repl and modifying the lakefile
+        # (this should already be done in the preflight checks),
+        # we just make a backup of the file to restore it later
+        bak = self.file_path.with_suffix(".bak")
+        logger.debug(f"Backing up modified file:", bak)
+        # assert not bak.exists(), f'{bak.resolve()} already exists'
+        if bak.exists():
+            logger.debug("Backup already exists. Assuming that a previous run crashed and that the backup is valid. Restoring from backup and proceeding...")
+            shutil.copy(bak, self.file_path)
+        else:
+            shutil.copy(self.file_path, bak)
