@@ -580,6 +580,7 @@ class InitOptimizedDojo(Dojo):
 
     """
     initialized_repos = set()
+    default_tmp_dir = None
     
     @classmethod
     def check_repo_init(cls, repo: LeanGitRepo, tmp_dir: Path):
@@ -659,12 +660,13 @@ class InitOptimizedDojo(Dojo):
     def __init__(
         self,
         entry: Union[Theorem, Tuple[LeanGitRepo, Path, int]],
-        tmp_dir: Path,
+        tmp_dir: Optional[Path] = None,
         hard_timeout: Optional[float] = None,
         additional_imports: List[str] = [],
     ):
         super().__init__(entry, hard_timeout, additional_imports)
-        self.tmp_dir = tmp_dir
+        self.tmp_dir = tmp_dir or self.default_tmp_dir or Path(mkdtemp(dir=TMP_DIR))
+        logger.debug(f"Using temporary directory {self.tmp_dir}")
         self.init_repo(self.repo, self.tmp_dir)
     
     def _setup_repo(self, traced_repo_path) -> None:
