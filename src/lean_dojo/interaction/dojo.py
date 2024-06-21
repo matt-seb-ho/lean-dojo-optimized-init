@@ -681,10 +681,21 @@ class InitOptimizedDojo(Dojo):
         return None
 
     def _cleanup_tmp_dir(self) -> None:
-        # restores modified file instead of deleting the temporary directory
+        # restores modified file instead of deleting the temporary directory; cd's back to original wd
         # - patches the original Dojo's __enter__ exception handling & __exit__ cleanup
-        logger.debug(f"Restoring modified file.")
-        os.rename(self.file_path.with_suffix(".bak"), self.file_path)
+        # - timing code encountered error of .bak not existing, this implies 
+        #   (1) backup was never made/file was never modified -OR-
+        #   (2) backup was already restored from
+        #   - in either case, the original copy should be fine, just log for debugging purposes
+        bak = self.file_path.with_suffix(".bak")
+        if bak.exists():
+            logger.debug(f"Restoring modified file.")
+            os.rename(bak, self.file_path)
+        else:
+            # assert self.file_path.exists()
+            logger.debug(f"Backup lean file does not exist. self.file_path.exists(): {self.file_path.exists()}")
+            if not self.file_path.exists():
+                logger.error(f"self.file_path ({self.file_path}) does NOT exist")
         os.chdir(self.origin_dir)
 
     def _modify_file(self, traced_file: TracedFile) -> None:
